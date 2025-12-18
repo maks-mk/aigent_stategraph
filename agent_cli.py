@@ -191,9 +191,23 @@ async def main():
         # Возвращаем уровень логирования обратно (важно для работы агента)
         logger.setLevel(previous_level)
         
-    model = workflow.config.gemini_model if workflow.config.provider == "gemini" else workflow.config.openai_model
-    console.print(f"[dim]Model: {model} | Tools: {len(workflow.tools)}[/]")
-    console.print("[dim]Type 'exit', 'reset' or just chat.[/]\n")
+    model = (
+        workflow.config.gemini_model
+        if workflow.config.provider == "gemini"
+        else workflow.config.openai_model
+    )
+
+    tools = len(workflow.tools)
+
+    console.print(
+        f"[dim]Model:[/] [bold cyan]{model}[/]  "
+        f"[dim]Tools:[/] [bold cyan]{tools}[/]"
+    )
+    
+    console.print(
+        "[bold blue]Enter[/] [bold green]↵[/] — отправить  |  "
+        "[bold blue]Alt+Enter[/] [bold yellow]⎇↵[/] — новая строка\n"
+    )
 
     session = PromptSession(
         history=FileHistory(".history"),
