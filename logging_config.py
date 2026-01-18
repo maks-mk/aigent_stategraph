@@ -5,10 +5,13 @@ from pathlib import Path
 from typing import Optional, List
 
 # Импорт Rich для красивого вывода
-from rich.logging import RichHandler
+try:
+    from rich.logging import RichHandler
+except ImportError:
+    RichHandler = None
 
 class IgnoreSchemaWarnings(logging.Filter):
-    """Фильтр для подавления специфических предупреждений."""
+    """Фильтр для подавления специфических предупреждений Pydantic/LangChain."""
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
         return "Key 'additionalProperties' is not supported" not in msg and \
@@ -16,33 +19,37 @@ class IgnoreSchemaWarnings(logging.Filter):
 
 def setup_logging(
     level: Optional[int] = None,
-    log_file: Optional[str] = None,
-    format_string: str = "%(message)s"
+    log_file: Optional[str] = None
 ) -> logging.Logger:
     
+    # 1. Определяем уровень логирования
     if level is None:
         env_level = os.getenv("LOG_LEVEL", "INFO").upper()
         level = getattr(logging, env_level, logging.INFO)
 
     if log_file is None:
-        log_file = os.getenv("LOG_FILE", "ai_agent.log")
+        log_file = os.getenv("LOG_FILE", "logs/agent.log")
 
     handlers: List[logging.Handler] = []
 
-    # --- H1: КРАСИВЫЙ КОНСОЛЬНЫЙ ВЫВОД (RICH) ---
-    console_handler = RichHandler(
-        rich_tracebacks=False,  # <--- ИЗМЕНЕНО: False убирает "мусор" с кодом
-        markup=True,
-        show_path=False,
-        show_time=True,
-        omit_repeated_times=False
-    )
+    # 2. Консольный хендлер (Rich или стандартный)
+    if RichHandler:
+        console_handler = RichHandler(
+            rich_tracebacks=False,
+            markup=True,
+            show_path=False,
+            show_time=True,
+            omit_repeated_times=False
+        )
+        console_handler.setFormatter(logging.Formatter("%(message)s"))
+    else:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    
     console_handler.setLevel(level)
-    console_handler.setFormatter(logging.Formatter("%(message)s"))
     handlers.append(console_handler)
 
-    # --- H2: ФАЙЛОВЫЙ ВЫВОД (ДЛЯ ОТЛАДКИ) ---
-    # В файл мы всё равно пишем полную ошибку на случай, если нужно разобраться
+    # 3. Файловый хендлер (Всегда пишет DEBUG для истории)
     if log_file:
         try:
             log_path = Path(log_file)
@@ -54,24 +61,30 @@ def setup_logging(
             file_handler.setFormatter(file_fmt)
             handlers.append(file_handler)
         except Exception as e:
-            sys.stderr.write(f"⚠️ Не удалось создать лог-файл: {e}\n")
+            # Не падаем, если нет прав на запись лога, просто пишем в stderr
+            sys.stderr.write(f"⚠️ Warning: Could not create log file: {e}\n")
 
+    # 4. Применяем конфигурацию
     logging.basicConfig(level=level, handlers=handlers, force=True)
 
-    # Фильтры и подавление шума (оставляем как было)
+    # 5. Фильтры шума
     schema_filter = IgnoreSchemaWarnings()
     for h in handlers:
         h.addFilter(schema_filter)
 
+    # Список болтливых библиотек
     noisy_modules = [
-        "langchain_mcp_adapters", "mcp", "jsonschema", "langchain_google_genai",
-        "httpcore", "httpx", "openai", "chromadb", "hnswlib", 
-        "google.ai.generativelanguage", "urllib3", "multipart",
-        "sentence_transformers", "filelock", "grpc", "grpc._cython" # <-- Добавил grpc
+        "langchain_mcp_adapters", "mcp", "jsonschema", 
+        "langchain_google_genai", "google.ai.generativelanguage",
+        "httpcore", "httpx", "openai", "urllib3", "multipart",
+        "chromadb", "hnswlib", "sentence_transformers", "filelock",
+        "grpc", "grpc._cython", "pydantic", "langgraph"
     ]
     
-    lib_level = logging.ERROR if level > logging.DEBUG else logging.WARNING
+    # Если мы в режиме DEBUG, библиотекам даем WARNING, иначе ERROR
+    lib_level = logging.WARNING if level == logging.DEBUG else logging.ERROR
+    
     for module_name in noisy_modules:
         logging.getLogger(module_name).setLevel(lib_level)
 
-    return logging.getLogger("AgentCore")
+    return logging.getLogger("Agent")

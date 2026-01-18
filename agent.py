@@ -1,15 +1,18 @@
-import os
 import json
 import asyncio
 import logging
+import re
 from pathlib import Path
 from datetime import datetime
-from typing import List, Literal, TypedDict, Annotated, Optional
+from typing import List, Literal, TypedDict, Annotated, Optional, Any, Union
 
 # --- LANGCHAIN & LANGGRAPH ---
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import tool, BaseTool
-from langchain_core.messages import BaseMessage, SystemMessage, AIMessage, RemoveMessage, HumanMessage
+from langchain_core.messages import (
+    BaseMessage, SystemMessage, RemoveMessage, HumanMessage, AIMessage, ToolMessage
+)
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -19,44 +22,30 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 
-# --- CONFIG & UTILS ---
-from pydantic import Field, SecretStr
+# --- CONFIG ---
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from dotenv import load_dotenv
 
 # --- LOCAL MODULES ---
-# 1. LOGGING (Подключаем ваш модуль)
 try:
     from logging_config import setup_logging
-    # Инициализируем логгер через ваш конфиг (Rich + File + Filters)
     logger = setup_logging() 
 except ImportError:
-    # Fallback на случай, если файла нет
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("agent")
-    logger.warning("logging_config.py not found, using default logging.")
 
-# 2. FILE TOOLS
+# --- OPTIONAL DEPENDENCIES ---
 try:
-    from delete_tools import SafeDeleteFileTool, SafeDeleteDirectoryTool
+    import tiktoken
 except ImportError:
-    SafeDeleteFileTool = SafeDeleteDirectoryTool = None
-
-# 3. MCP CLIENT
-try:
-    from langchain_mcp_adapters.client import MultiServerMCPClient
-except ImportError:
-    MultiServerMCPClient = None
-
+    tiktoken = None
 
 # ==========================================
-# 1. КОНФИГУРАЦИЯ (Pydantic)
+# 1. КОНФИГУРАЦИЯ (CONFIG)
 # ==========================================
 
 class AgentConfig(BaseSettings):
-    """
-    Конфигурация агента. Читает параметры из файла .env
-    """
     model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
 
     provider: Literal["gemini", "openai"] = "gemini"
@@ -69,366 +58,622 @@ class AgentConfig(BaseSettings):
     openai_model: str = "gpt-4o"
     openai_base_url: Optional[str] = None
 
-    # LLM Settings
-    temperature: float = 0.5
-    max_retries: int = 3
+    temperature: float = 0.2
     
-    # Agent Logic Settings
+    # Настройка Deep Search (true/false)
+    enable_deep_search: bool = Field(default=False, alias="DEEP_SEARCH")
+    
+    # Ручное управление поддержкой инструментов (по умолчанию True)
+    model_supports_tools: bool = Field(default=True, alias="MODEL_SUPPORTS_TOOLS")
+
+    # Logic Settings
     use_long_term_memory: bool = Field(default=False, alias="LONG_TERM_MEMORY")
-    summary_threshold: int = Field(default=15, alias="SESSION_SIZE")
+    max_loops: int = Field(default=15, description="Limit steps per request")
+    
+    # Summarization Settings
+    summary_threshold: int = Field(default=20, alias="SESSION_SIZE")
+    summary_keep_last: int = Field(default=4, alias="SUMMARY_KEEP_LAST")
     
     # Paths
+    prompt_path: Path = Field(default=Path("prompt.txt"), alias="PROMPT_PATH")
     mcp_config_path: Path = Path("mcp.json")
-    prompt_path: Path = Path("prompt.txt")
     memory_db_path: str = "./memory_db"
 
+    @model_validator(mode='after')
+    def validate_provider_keys(self) -> 'AgentConfig':
+        if self.provider == "gemini" and not self.gemini_api_key:
+            raise ValueError("GEMINI_API_KEY required for gemini provider.")
+        if self.provider == "openai" and not self.openai_api_key:
+            raise ValueError("OPENAI_API_KEY required for openai provider.")
+        return self
+
+    def check_tool_support(self) -> bool:
+        """
+        Определяет, поддерживает ли текущая модель вызов инструментов.
+        1. Смотрит на явный флаг MODEL_SUPPORTS_TOOLS в .env
+        2. Если флаг True, проверяет черный список моделей (эвристика).
+        """
+        if not self.model_supports_tools:
+            return False
+            
+        # Эвристика для OpenRouter и других провайдеров
+        if self.provider == "openai":
+            model_name = self.openai_model.lower()
+            # Список моделей, которые точно не умеют в Tools или работают плохо
+            no_tool_prefixes = (
+                "tngtech/", 
+                "huggingface/",
+                "grey-wing/",
+                "sao10k/" 
+            )
+            if model_name.startswith(no_tool_prefixes):
+                return False
+                
+        return True
+
     def get_llm(self) -> BaseChatModel:
-        """Инициализация LLM в зависимости от провайдера."""
         if self.provider == "gemini":
-            if not self.gemini_api_key:
-                raise ValueError("GEMINI_API_KEY не найден в .env")
             return ChatGoogleGenerativeAI(
                 model=self.gemini_model,
                 temperature=self.temperature,
                 google_api_key=self.gemini_api_key.get_secret_value(),
-                max_retries=self.max_retries,
                 convert_system_message_to_human=True
             )
         elif self.provider == "openai":
-            if not self.openai_api_key:
-                raise ValueError("OPENAI_API_KEY не найден в .env")
             return ChatOpenAI(
                 model=self.openai_model,
                 temperature=self.temperature,
                 api_key=self.openai_api_key.get_secret_value(),
                 base_url=self.openai_base_url,
-                max_retries=self.max_retries,
-                model_kwargs={"stream_options": {"include_usage": True}}
+                model_kwargs={
+                    "stream_options": {"include_usage": True},
+                    "frequency_penalty": 0.6,
+                    "presence_penalty": 0.3,
+                }            
             )
         raise ValueError(f"Unknown provider: {self.provider}")
 
 
 # ==========================================
-# 2. СОСТОЯНИЕ ГРАФА
+# 2. УТИЛИТЫ (UTILS)
+# ==========================================
+
+class AgentUtils:
+    """Вспомогательные функции для токенов, путей и санитайзинга."""
+    
+    def __init__(self):
+        try:
+            self._encoder = tiktoken.get_encoding("cl100k_base") if tiktoken else None
+        except Exception:
+            self._encoder = None
+
+    def count_tokens(self, text: str) -> int:
+        if not text: return 0
+        if self._encoder:
+            return len(self._encoder.encode(text))
+        return len(text) // 3
+
+    def estimate_payload_tokens(self, messages: List[BaseMessage], tools: List[BaseTool]) -> int:
+        """Считает токены сообщений + схемы инструментов."""
+        total = 0
+        for m in messages:
+            content = m.content if isinstance(m.content, str) else ""
+            if isinstance(m.content, list):
+                content = " ".join([str(x) for x in m.content])
+            total += self.count_tokens(content)
+        
+        if tools:
+            try:
+                tool_schemas = [convert_to_openai_tool(t) for t in tools]
+                tools_json = json.dumps(tool_schemas, ensure_ascii=False)
+                total += self.count_tokens(tools_json)
+            except Exception:
+                pass
+        return total
+
+    @staticmethod
+    def sanitize_path(path: str) -> str:
+        """Чистит путь от мусора (:ru:, win-chars)."""
+        path = re.sub(r'^:[a-z]{2,3}:', '', path)
+        path = re.sub(r'[<>:"|?*]+', '', path)
+        return path.strip()
+
+    @staticmethod
+    def fix_tool_calls(tool_calls: List[dict]):
+        """Чистит аргументы (пути, url) в вызовах инструментов."""
+        import time 
+        from pathlib import Path
+
+        path_keys = {"path", "file_path", "dir_path", "destination", "source", "filename"}
+        url_keys = {"url", "link", "target_url", "query", "urls"} 
+
+        for tc in tool_calls:
+            args = tc.get("args")
+            name = tc.get("name")
+            
+            def clean_val(k, v):
+                if not isinstance(v, str): return v
+                
+                # --- ЛОГИКА ОБРАБОТКИ ПУТЕЙ ---
+                if k in path_keys:
+                    # 1. Предварительная грубая очистка от кавычек и двоеточий по краям
+                    v = v.strip().strip('"').strip("'").strip(":").strip()
+                    
+                    if not v or v == ".":
+                        return f"doc_{int(time.time())}.txt"
+
+                    path_obj = Path(v)
+                    
+                    # Если путь абсолютный - ДОВЕРЯЕМ ЕМУ
+                    if path_obj.is_absolute():
+                        return str(path_obj)
+                    
+                    # Если путь относительный - чистим каждый кусок
+                    clean_parts = [
+                        AgentUtils.sanitize_path(p) 
+                        for p in path_obj.parts 
+                        if p not in [".", "..", "\\", "/"]
+                    ]
+                    
+                    if not clean_parts:
+                         return f"doc_{int(time.time())}.txt"
+                    
+                    return str(Path(*clean_parts))
+                    
+                # --- ОБРАБОТКА URL ---
+                if name == "fetch_content" and (k in url_keys or k == "url" or k == "urls"):
+                    if isinstance(v, list):
+                         return [clean_val("url", item) for item in v]
+                    
+                    clean = v.strip().strip("'").strip('"').strip("{}").strip(":")
+                    if "http" in v and not clean.startswith("http"):
+                        match = re.search(r'(https?://[^\s\'"<>{}]+)', v)
+                        if match: clean = match.group(1)
+                    return clean
+                return v
+
+            if isinstance(args, dict):
+                for key, value in args.items():
+                    args[key] = clean_val(key, value)
+            elif isinstance(args, list) and len(args) > 0:
+                if isinstance(args[0], (str, list)):
+                    fake_key = "urls" if name == "fetch_content" else "path"
+                    args[0] = clean_val(fake_key, args[0])
+
+
+# ==========================================
+# 3. РЕЕСТР ИНСТРУМЕНТОВ (TOOLS REGISTRY)
+# ==========================================
+
+class ToolRegistry:
+    """Управляет загрузкой и инициализацией инструментов."""
+    
+    def __init__(self, config: AgentConfig):
+        self.config = config
+        self.tools: List[BaseTool] = []
+
+    async def load_all(self):
+        """Загружает все доступные группы инструментов."""
+        self._load_file_tools()
+        self._load_search_tools()
+        
+        if self.config.use_long_term_memory:
+            self._load_memory_tools()
+            
+        if self.config.mcp_config_path.exists():
+            await self._load_mcp_tools()
+
+        logger.info(f"✅ Tools loaded: {[t.name for t in self.tools]}")
+
+    def _load_file_tools(self):
+        try:
+            from delete_tools import SafeDeleteFileTool, SafeDeleteDirectoryTool
+            cwd = Path.cwd()
+            self.tools.extend([
+                SafeDeleteFileTool(root_dir=cwd),
+                SafeDeleteDirectoryTool(root_dir=cwd)
+            ])
+        except ImportError:
+            pass
+
+    def _load_search_tools(self):
+        try:
+            # 1. Импортируем batch_web_search
+            from search_tools import web_search, deep_search, fetch_content, batch_web_search
+            
+            if web_search and fetch_content:
+                # 2. Добавляем в список инструментов
+                self.tools.extend([web_search, batch_web_search, fetch_content])
+            
+            if self.config.enable_deep_search and deep_search:
+                logger.info("🔹 Deep Search tool is ENABLED")
+                self.tools.append(deep_search)
+        except ImportError:
+            logger.warning("Search tools dependencies missing.")
+            
+    def _load_memory_tools(self):
+        try:
+            from memory_manager import MemoryManager
+            memory = MemoryManager(db_path=self.config.memory_db_path)
+            
+            @tool
+            async def remember_fact(text: str, category: str = "general") -> str:
+                """
+                Saves a piece of information to long-term memory.
+                Use this to remember user preferences, important facts, or context for future sessions.
+                """
+                return await memory.aremember(text, {"type": category})
+            
+            @tool
+            async def recall_facts(query: str) -> str:
+                """
+                Searches long-term memory for relevant facts based on a query.
+                Use this when you need to recall past context or user details.
+                """
+                facts = await memory.arecall(query)
+                return "\n".join(f"- {f}" for f in facts) if facts else "No facts found."
+            
+            @tool
+            async def forget_fact(query: str) -> str:
+                """
+                Removes a specific fact from memory by content query.
+                Use this only when explicitly asked to forget something.
+                """
+                return f"Forgotten: {await memory.adelete_fact_by_query(query)}"
+
+            self.tools.extend([remember_fact, recall_facts, forget_fact])
+        except ImportError:
+            logger.warning("MemoryManager not available.")
+            
+    async def _load_mcp_tools(self):
+        try:
+            from langchain_mcp_adapters.client import MultiServerMCPClient
+            raw_cfg = json.loads(self.config.mcp_config_path.read_text("utf-8"))
+            mcp_cfg = {
+                name: {
+                    **{k: v for k, v in cfg.items() if k != 'enabled'},
+                    "args": cfg.get("args", [])
+                }
+                for name, cfg in raw_cfg.items() if cfg.get("enabled", True)
+            }
+            if mcp_cfg:
+                client = MultiServerMCPClient(mcp_cfg)
+                new_tools = await asyncio.wait_for(client.get_tools(), timeout=120)
+                self.tools.extend(new_tools)
+        except Exception as e:
+            logger.error(f"MCP Load Error: {e}")
+
+
+# ==========================================
+# 4. СОСТОЯНИЕ (STATE)
 # ==========================================
 
 class AgentState(TypedDict):
-    """
-    messages: История сообщений (автоматически объединяется).
-    summary: Сжатое содержание предыдущего контекста.
-    """
     messages: Annotated[list[BaseMessage], add_messages]
     summary: str
+    steps: int
 
 
 # ==========================================
-# 3. WORKFLOW АГЕНТА
+# 5. ГРАФ АГЕНТА (WORKFLOW)
 # ==========================================
 
 class AgentWorkflow:
     def __init__(self):
         load_dotenv()
         self.config = AgentConfig()
-        self.tools: List[BaseTool] = []
+        self.utils = AgentUtils()
+        self.tool_registry = ToolRegistry(self.config)
+        
         self.llm: Optional[BaseChatModel] = None
         self.llm_with_tools: Optional[BaseChatModel] = None
-        self._cached_prompt: Optional[str] = None
-
-    @staticmethod
-    def _messages_to_summary_text(messages: List[BaseMessage], *, per_message_limit: int = 800, total_limit: int = 6000) -> str:
-        parts: List[str] = []
-        total = 0
-        for m in messages:
-            role = getattr(m, "type", m.__class__.__name__)
-            content = getattr(m, "content", "")
-            if isinstance(content, list):
-                content_str = "".join(
-                    (x.get("text", "") if isinstance(x, dict) else str(x))
-                    for x in content
-                )
-            else:
-                content_str = str(content)
-
-            content_str = content_str.strip()
-            if len(content_str) > per_message_limit:
-                content_str = content_str[:per_message_limit] + "..."
-
-            chunk = f"{role}: {content_str}".strip()
-            if not chunk:
-                continue
-
-            if total + len(chunk) + 1 > total_limit:
-                break
-            parts.append(chunk)
-            total += len(chunk) + 1
-
-        return "\n".join(parts)
 
     async def initialize_resources(self):
-        """Асинхронная инициализация всех ресурсов (LLM, инструменты, память)."""
-        logger.info(f"Initializing agent with provider: [bold cyan]{self.config.provider}[/]", extra={"markup": True})
+        logger.info(f"Initializing agent: [bold cyan]{self.config.provider}[/]", extra={"markup": True})
+        
+        # 1. LLM
         self.llm = self.config.get_llm()
-
-        # 1. Файловые инструменты (если модуль найден)
-        if SafeDeleteFileTool and SafeDeleteDirectoryTool:
-            cwd = Path.cwd()
-            self.tools.extend([
-                SafeDeleteFileTool(root_dir=cwd),
-                SafeDeleteDirectoryTool(root_dir=cwd)
-            ])
-            logger.info("File system tools loaded (Sandbox enabled).")
-
-        # 2. Долговременная память
-        if self.config.use_long_term_memory:
-            self._init_memory_tools()
-
-        # 3. MCP Tools (если есть конфиг и библиотека)
-        if MultiServerMCPClient and self.config.mcp_config_path.exists():
-            await self._init_mcp_tools()
-
-        # Привязка инструментов к LLM
-        if self.tools:
-            self.llm_with_tools = self.llm.bind_tools(self.tools)
+        
+        # 2. Tools
+        await self.tool_registry.load_all()
+        
+        # 3. Binding с проверкой поддержки инструментов!
+        can_use_tools = self.config.check_tool_support()
+        
+        if self.tool_registry.tools and can_use_tools:
+            try:
+                self.llm_with_tools = self.llm.bind_tools(self.tool_registry.tools)
+                logger.info("🛠️ Tools bound to LLM successfully.")
+            except Exception as e:
+                logger.error(f"Failed to bind tools (LLM might not support them): {e}")
+                self.llm_with_tools = self.llm
         else:
+            if not can_use_tools:
+                logger.warning("⚠️ Tools disabled: Model does not support tool calling (or disabled in config).")
             self.llm_with_tools = self.llm
 
-    def _init_memory_tools(self):
-        """Инициализация инструментов памяти (Recall, Remember, Forget)."""
-        try:
-            from memory_manager import MemoryManager
-            # Инициализируем менеджер (Singleton)
-            memory = MemoryManager(db_path=self.config.memory_db_path)
-            
-            @tool
-            async def remember_fact(text: str, category: str = "general") -> str:
-                """
-                Сохраняет важный факт о пользователе, проекте или предпочтениях.
-                """
-                return await memory.aremember(text, {"type": category})
+    @property
+    def tools(self) -> List[BaseTool]:
+        return self.tool_registry.tools
 
-            @tool
-            async def recall_facts(query: str) -> str:
-                """
-                Ищет информацию в долговременной памяти по смысловому запросу.
-                """
-                facts = await memory.arecall(query)
-                return "\n".join(f"- {f}" for f in facts) if facts else "В памяти ничего не найдено."
-
-            @tool
-            async def forget_fact(query: str) -> str:
-                """
-                Удаляет информацию из памяти. Используйте, если пользователь просит забыть что-то,
-                или если информация стала неверной.
-                """
-                try:
-                    count = await memory.adelete_fact_by_query(query)
-                    if count > 0:
-                        return f"Успешно забыто фактов: {count}"
-                    return "Факты для удаления не найдены."
-                except Exception as e:
-                    return f"Ошибка при удалении: {e}"
-
-            self.tools.extend([remember_fact, recall_facts, forget_fact])
-            logger.info("Memory tools loaded (Remember, Recall, Forget).")
-        except ImportError:
-            logger.warning("MemoryManager module not found. Memory tools disabled.")
-        except Exception as e:
-            logger.error(f"Error loading memory tools: {e}")
-
-    async def _init_mcp_tools(self):
-        """Загрузка инструментов через Model Context Protocol (MCP)."""
-        if not self.config.mcp_config_path.exists():
-            return
-
-        try:
-            raw_cfg = json.loads(self.config.mcp_config_path.read_text("utf-8"))
-            
-            mcp_cfg = {}
-            for name, config in raw_cfg.items():
-                # Пропускаем, если выключено
-                if not config.get("enabled", True):
-                    continue
-                
-                # Создаем чистую копию для клиента MCP
-                clean_config = config.copy()
-                
-                # УДАЛЯЕМ ключ 'enabled', чтобы клиент MCP не ругался
-                clean_config.pop("enabled", None)
-                
-                # Подставляем пути
-                current_args = clean_config.get("args", [])
-                clean_config["args"] = [
-                    arg.replace("{filesystem_path}", str(Path.cwd())) 
-                    for arg in current_args
-                ]
-                
-                mcp_cfg[name] = clean_config
-            
-            if mcp_cfg:
-                client = MultiServerMCPClient(mcp_cfg)
-                if hasattr(asyncio, "timeout"):
-                    async with asyncio.timeout(60):
-                        new_tools = await client.get_tools()
-                else:
-                    new_tools = await asyncio.wait_for(client.get_tools(), timeout=60)
-
-                self.tools.extend(new_tools)
-                logger.info(f"Loaded {len(new_tools)} MCP tools from: {list(mcp_cfg.keys())}")
-        except Exception as e:
-            logger.error(f"MCP Load Error: {e}")
-
-    def _get_system_prompt(self) -> str:
-        """Генерация системного промпта с кэшированием шаблона."""
-        if not self._cached_prompt:
-            if self.config.prompt_path.exists():
-                self._cached_prompt = self.config.prompt_path.read_text("utf-8")
-            else:
-                self._cached_prompt = "Role: AI Assistant. Be helpful."
-
-        now = datetime.now()
-        prompt = self._cached_prompt.replace("{{current_date}}", now.strftime("%Y-%m-%d (%A)"))
-        prompt = prompt.replace("{{cwd}}", str(Path.cwd()))
-        return prompt
-
-    # ==========================================
-    # 4. УЗЛЫ ГРАФА (NODES)
-    # ==========================================
+    # --- NODES ---
 
     async def _summarize_node(self, state: AgentState):
-        """
-        Узел сжатия истории. Гарантирует, что история всегда начинается с HumanMessage.
-        """
+        """Узел сжатия истории сообщений."""
         messages = state["messages"]
         summary = state.get("summary", "")
 
-        if not self.llm:
+        if len(messages) <= self.config.summary_threshold:
             return {}
 
-        if len(messages) > self.config.summary_threshold:
-            # 1. Сначала определяем, сколько сообщений мы ХОТИМ оставить
-            keep_last = 4 
-            
-            # Если сообщений и так мало, выходим
-            if len(messages) <= keep_last:
-                return {}
-
-            # 3. Умная корректировка границы:
-            # Проверяем первое сообщение, которое ОСТАНЕТСЯ (messages[-keep_last]).
-            # Если оно НЕ HumanMessage, нам нужно удалить и его тоже.
-            # Мы сдвигаем границу вправо, пока не найдем HumanMessage или пока не кончатся сообщения.
-            
-            idx_start_keep = len(messages) - keep_last
-            
-            while idx_start_keep < len(messages):
-                msg = messages[idx_start_keep]
-                if isinstance(msg, HumanMessage):
-                    break # Нашли начало диалога с пользователем, всё ок
-                
-                # Если это не пользователь (AI или Tool), это сообщение тоже надо сжать/удалить
-                idx_start_keep += 1
-            
-            # Если мы дошли до конца и не нашли HumanMessage, значит удаляем вообще всё
-            # (это лучше, чем отправлять битую историю)
-            
-            # Формируем окончательный список на удаление
-            to_summarize = messages[:idx_start_keep]
-            
-            if not to_summarize:
-                return {}
-
-            to_summarize_text = self._messages_to_summary_text(to_summarize)
-
-            prompt = (
-                f"Current summary: {summary}\n"
-                f"New interactions:\n{to_summarize_text}\n\n"
-                "Create a concise updated summary of the conversation, preserving key facts and user requests."
-            )
-            
-            try:
-                # Генерируем саммари
-                res = await self.llm.ainvoke(prompt)
-                
-                # Удаляем сообщения
-                delete_msgs = [RemoveMessage(id=m.id) for m in to_summarize if m.id]
-                
-                logger.info(f"Summarized context. Removed {len(delete_msgs)} messages. New history starts with Human.")
-                return {"summary": res.content, "messages": delete_msgs}
-            except Exception as e:
-                logger.error(f"Summarization failed: {e}")
-                return {}
+        # Определяем точку среза (оставляем последние N)
+        idx = len(messages) - self.config.summary_keep_last
+        while idx < len(messages) and idx > 0:
+            if isinstance(messages[idx], HumanMessage):
+                break
+            idx += 1
         
-        return {}
+        to_summarize = messages[:idx]
+        if not to_summarize: return {}
+
+        history_text = "\n".join([f"{m.type}: {m.content}" for m in to_summarize])
         
+        prompt = (
+            f"Current memory context:\n<previous_context>\n{summary}\n</previous_context>\n\n"
+            f"New events:\n{history_text}\n\n"
+            "Update <previous_context>. Keep only key facts, decisions, and results. "
+            "Remove chit-chat. Return only the updated context text."
+        )
+        
+        try:
+            res = await self.llm.ainvoke(prompt)
+            delete_msgs = [RemoveMessage(id=m.id) for m in to_summarize if m.id]
+            logger.info(f"🧹 Summary: Removed {len(delete_msgs)} messages.")
+            return {"summary": res.content, "messages": delete_msgs}
+        except Exception as e:
+            logger.error(f"Summarization Error: {e}")
+            return {}
+
     async def _agent_node(self, state: AgentState):
-        """
-        Главный узел агента.
-        """
-        if not self.llm_with_tools:
-            raise RuntimeError("AgentWorkflow is not initialized. Call initialize_resources() before build_graph()/run.")
-
+        """Основной узел принятия решений."""
+        # 1. Подготовка контекста
         messages = state["messages"]
-        summary = state.get("summary", "")
         
-        sys_text = self._get_system_prompt()
-        if summary:
-            sys_text += f"\n\n### Context Summary\n{summary}"
+        # Определяем, доступны ли инструменты для текущего запуска
+        tools_available = (self.llm_with_tools != self.llm)
         
-        sys_msg = SystemMessage(content=sys_text)
-        user_history = [m for m in messages if not isinstance(m, SystemMessage)]
+        sys_msg = self._build_system_message(state.get("summary", ""), tools_available)
+        full_context = [sys_msg] + [m for m in messages if not isinstance(m, SystemMessage)]
         
-        final_messages = [sys_msg] + user_history
+        # 2. Вызов LLM с Retry Logic
+        response = await self._invoke_llm_with_retry(full_context)
         
-        response = await self.llm_with_tools.ainvoke(final_messages)
+        # 3. Пост-обработка (Sanitizing)
+        if response.tool_calls:
+            self.utils.fix_tool_calls(response.tool_calls)
+            
+        # 4. Проверка безопасности (Quality Gate)
+        if self._is_unsafe_write(response, full_context):
+            response = AIMessage(
+                content="STOP. You are trying to write a file without valid data from search/fetch. "
+                        "Perform a search first to get actual content."
+            )
+
+        # 5. Патч токенов
+        self._patch_token_usage(response, full_context)
+        
+        if response.tool_calls:
+            last_msg = messages[-1] if messages else None
+            if isinstance(last_msg, ToolMessage):
+                current_tool = response.tool_calls[0]['name']
+                last_tool = last_msg.name
+                
+                # Блокируем повторную запись
+                if current_tool == "write_file" and last_tool == "write_file":
+                    logger.warning("🛑 Loop Guard: Blocked repetitive write_file.")
+                    response = AIMessage(
+                        content="System: File already written. Stop overwriting. Summarize what you did."
+                    )
+
         return {"messages": [response]}
 
-    # ==========================================
-    # 5. СБОРКА ГРАФА
-    # ==========================================
+    async def _loop_guard_node(self, state: AgentState):
+        return {"messages": [AIMessage(content="🛑 **Auto-Stop**: Max steps limit reached.")]}
+
+    # --- HELPERS ---
+
+    def _build_system_message(self, summary: str, tools_available: bool = True) -> SystemMessage:
+        if self.config.prompt_path.exists():
+            raw_prompt = self.config.prompt_path.read_text("utf-8")
+        else:
+            raw_prompt = (
+                "You are an autonomous AI agent.\n"
+                "Reason in English, Reply in Russian.\n"
+                "Date: {{current_date}}\nCWD: {{cwd}}"
+            )
+        
+        prompt = raw_prompt.replace("{{current_date}}", datetime.now().strftime("%Y-%m-%d"))
+        prompt = prompt.replace("{{cwd}}", str(Path.cwd()))
+        
+        if not tools_available:
+            prompt += "\nNOTE: You are in CHAT-ONLY mode. Tools are disabled for this session. Do not try to use tools."
+        elif self.config.use_long_term_memory:
+             prompt += "\nUse memory tools (recall_facts/remember_fact) when necessary."
+             
+        if summary:
+            prompt += f"\n\n<memory>\n{summary}\n</memory>"
+            
+        return SystemMessage(content=prompt)
+
+    async def _invoke_llm_with_retry(self, context: List[BaseMessage]) -> AIMessage:
+        """
+        Вызов LLM с универсальным механизмом восстановления (Self-Correction) при сбоях.
+        """
+        # Список ошибок, при которых нет смысла делать Retry (сразу сдаемся)
+        FATAL_ERRORS = ["401", "unauthorized", "quota", "billing", "context_length_exceeded"]
+
+        for attempt in range(3):
+            try:
+                response = await self.llm_with_tools.ainvoke(context)
+                
+                # Проверка на пустой ответ (бывает у некоторых API)
+                if not response.content and not response.tool_calls:
+                    raise ValueError("Empty response from LLM")
+                    
+                return response
+
+            except Exception as e:
+                error_str = str(e).lower()
+                
+                # 1. Если ошибка фатальная — прерываем сразу
+                if any(err in error_str for err in FATAL_ERRORS):
+                    logger.error(f"🛑 Fatal LLM Error: {e}")
+                    return AIMessage(content=f"System Error: API refused request ({e})")
+
+                # 2. Логика восстановления (только если это не последняя попытка)
+                if attempt < 2:
+                    # TИХИЙ ЛОГ (DEBUG)
+                    logger.debug(f"⚠️ LLM Crash (Attempt {attempt+1}): {e}. Trying to recover...")
+                    
+                    last_msg = context[-1] if context else None
+                    
+                    # Сценарий A: Упали после ToolMessage
+                    if isinstance(last_msg, ToolMessage):
+                        recovery_prompt = (
+                            "SYSTEM NOTICE: The tool execution was completed, but the subsequent AI response crashed due to a network error. "
+                            "INSTRUCTION: Look at the last ToolMessage in the context above. "
+                            "Analyze its output (whether success or error) and formulate a response to the user based on it. "
+                            "Do not mention the network crash."
+                        )
+                    # Сценарий B: Упали при ответе юзеру
+                    elif isinstance(last_msg, HumanMessage):
+                        recovery_prompt = (
+                            "SYSTEM NOTICE: Your previous attempt to answer crashed. "
+                            "INSTRUCTION: Please try to answer the user's last message again."
+                        )
+                    # Сценарий C: Прочее
+                    else:
+                        recovery_prompt = "SYSTEM NOTICE: Connection glitch. Please retry your last action."
+
+                    # --- ПОПЫТКА ВОССТАНОВЛЕНИЯ ---
+                    try:
+                        recovery_msg = SystemMessage(content=recovery_prompt)
+                        return await self.llm_with_tools.ainvoke(context + [recovery_msg])
+                    except Exception as recovery_error:
+                        # ТОЖЕ ТИХИЙ ЛОГ (DEBUG), чтобы не пугать юзера красным текстом, 
+                        # ведь у нас еще может быть следующая попытка цикла.
+                        logger.debug(f"❌ Recovery failed: {recovery_error}")
+                        await asyncio.sleep(1)
+                        continue
+                
+                # Если это была последняя попытка — тут уже ERROR нужен
+                logger.error(f"💀 All retries failed: {e}")
+                
+        # Фолбэк
+        last_tool_status = "Unknown"
+        if context and isinstance(context[-1], ToolMessage):
+            last_tool_status = "Tool executed, but AI cannot report result."
+            
+        return AIMessage(content=f"**System Failure**: Multiple API crashes. ({last_tool_status})")
+        
+    def _is_unsafe_write(self, response: AIMessage, history: List[BaseMessage]) -> bool:
+        """Блокирует запись файла, если в истории нет успешных чтений/поиска."""
+        if not response.tool_calls: return False
+        if not any(tc['name'] == 'write_file' for tc in response.tool_calls): return False
+        
+        # Проверяем, были ли успешные получения данных
+        has_data = False
+        valid_sources = [
+            "fetch_content",    # Универсальный инструмент
+            "web_search", 
+            "deep_search",      
+            "read_text_file"
+        ]
+        
+        for m in history:
+            if isinstance(m, ToolMessage) and m.name in valid_sources:
+                content = str(m.content)
+                is_system_error = content.startswith("System:") or content.startswith("Error:")
+                
+                if not is_system_error and len(content) > 50:
+                    has_data = True
+                    break
+                    
+        if not has_data:
+            logger.warning("🛡️ Quality Gate: Blocked write_file (no data source).")
+            return True
+        return False
+
+    def _patch_token_usage(self, response: AIMessage, context: List[BaseMessage]):
+        """Добавляет метаданные о токенах, если их нет (для OpenAI/Compatible)."""
+        usage = response.usage_metadata or {}
+        if usage.get("input_tokens", 0) == 0:
+            input_tokens = self.utils.estimate_payload_tokens(context, self.tools)
+            output_content = response.content
+            if isinstance(output_content, list):
+                output_content = " ".join([str(x) for x in output_content])
+            
+            output_tokens = self.utils.count_tokens(str(output_content))
+            if response.tool_calls:
+                output_tokens += self.utils.count_tokens(json.dumps(response.tool_calls, default=str))
+
+            response.usage_metadata = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+                "token_source": "Manual"
+            }
+
+    # --- GRAPH BUILDER ---
 
     def build_graph(self):
-        """Компиляция графа LangGraph."""
         workflow = StateGraph(AgentState)
 
         workflow.add_node("summarize", self._summarize_node)
         workflow.add_node("agent", self._agent_node)
+        workflow.add_node("loop_guard", self._loop_guard_node)
+        workflow.add_node("update_step", lambda state: {"steps": state.get("steps", 0) + 1})
         
-        if self.tools:
+        # 🔥 ИСПРАВЛЕНИЕ: Добавляем узел tools ТОЛЬКО если они реально доступны
+        # Это предотвращает маршрутизацию в несуществующий узел для простых моделей
+        tools_enabled = bool(self.tools) and self.config.check_tool_support()
+        
+        if tools_enabled:
             workflow.add_node("tools", ToolNode(self.tools))
 
         workflow.add_edge(START, "summarize")
-        workflow.add_edge("summarize", "agent")
+        workflow.add_edge("summarize", "update_step") 
+        workflow.add_edge("update_step", "agent")
 
         def should_continue(state):
+            steps = state.get("steps", 0)
+            if steps >= self.config.max_loops:
+                logger.warning(f"🛑 Loop Guard: {steps} steps.")
+                return "loop_guard" 
+            
+            # 🔥 Если тулы отключены - ВСЕГДА выходим, даже если модель бредит
+            if not tools_enabled:
+                return END
+                
             last_msg = state["messages"][-1]
-            tool_calls = getattr(last_msg, "tool_calls", None)
-            return "tools" if tool_calls else END
+            return "tools" if getattr(last_msg, "tool_calls", None) else END
 
-        workflow.add_conditional_edges(
-            "agent",
-            should_continue,
-            ["tools", END] if self.tools else [END]
-        )
+        # 🔥 Динамические переходы
+        destinations = ["tools", "loop_guard", END] if tools_enabled else ["loop_guard", END]
+        workflow.add_conditional_edges("agent", should_continue, destinations)
 
-        if self.tools:
-            workflow.add_edge("tools", "agent")
+        if tools_enabled:
+            workflow.add_edge("tools", "update_step")
+
+        workflow.add_edge("loop_guard", END)
 
         return workflow.compile(checkpointer=MemorySaver())
 
-
-# ==========================================
-# 6. ТОЧКА ВХОДА (TEST)
-# ==========================================
-
 if __name__ == "__main__":
     async def main():
-        print("--- Testing Agent Initialization ---")
-        try:
-            wf = AgentWorkflow()
-            await wf.initialize_resources()
-            app = wf.build_graph()
-            print("✅ Agent Graph built successfully.")
-            print(f"🔧 Tools: {[t.name for t in wf.tools]}")
-        except Exception as e:
-            print(f"❌ Initialization failed: {e}")
+        wf = AgentWorkflow()
+        await wf.initialize_resources()
+        print(f"✅ Agent Ready. Tools: {len(wf.tools)}")
+        # wf.build_graph() # Test graph build
 
     asyncio.run(main())

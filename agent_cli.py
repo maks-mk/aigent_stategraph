@@ -3,10 +3,11 @@ import asyncio
 import warnings
 import time
 import re
-from typing import Dict, Tuple
 import logging
+from typing import Dict, Tuple, Any, Set, Optional
 
-from rich.console import Console
+# --- UI IMPORTS ---
+from rich.console import Console, Group
 from rich.panel import Panel
 from rich.markdown import Markdown
 from rich.live import Live
@@ -14,6 +15,7 @@ from rich.spinner import Spinner
 from rich.padding import Padding
 from rich.text import Text
 
+# --- PROMPT IMPORTS ---
 from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
@@ -21,8 +23,10 @@ from prompt_toolkit.lexers import PygmentsLexer
 from pygments.lexers.markup import MarkdownLexer
 from prompt_toolkit.history import FileHistory
 
+# --- LANGCHAIN IMPORTS ---
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, AIMessageChunk
 
+# --- LOCAL IMPORTS ---
 try:
     from agent import AgentWorkflow, logger
 except ImportError:
@@ -30,42 +34,124 @@ except ImportError:
     sys.path.append(".")
     from agent import AgentWorkflow, logger
 
+# --- OPTIONAL IMPORTS ---
+try:
+    import tiktoken
+    _ENCODER = tiktoken.get_encoding("cl100k_base")
+except ImportError:
+    _ENCODER = None
+
+# --- CONFIG ---
 warnings.filterwarnings("ignore")
 console = Console()
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# ======================================================
+# 1. TEXT PROCESSING UTILITIES
+# ======================================================
 
 _THOUGHT_RE = re.compile(r"<thought>(.*?)</thought>", re.DOTALL)
 
+def clean_markdown_text(text: str) -> str:
+    """
+    Убирает лишние отступы и двойные переносы строк перед списками.
+    Решает проблему визуальных 'дыр' в Rich Markdown.
+    """
+    if not text: return text
+    
+    # 1. Схлопываем множественные переносы (оставляем максимум 2)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    # 2. Убираем пустую строку перед элементами списка (•, -, *, 1.)
+    text = re.sub(r'\n\s*\n(\s*[•\-\*]|\d+\.)', r'\n\1', text)
+    
+    return text
+
+def parse_thought(text: str) -> Tuple[str, str, bool]:
+    """Отделяет скрытые мысли <thought> от основного текста."""
+    match = _THOUGHT_RE.search(text)
+    if match: 
+        return match.group(1).strip(), _THOUGHT_RE.sub('', text).strip(), True
+    
+    if "<thought>" in text and "</thought>" not in text:
+        start = text.find("<thought>") + len("<thought>")
+        return text[start:].strip(), text[:text.find("<thought>")], False
+        
+    return "", text, False
+
+# ======================================================
+# 2. UI UTILITIES
+# ======================================================
+
 class TokenTracker:
     def __init__(self):
-        self.input = 0
-        self.output = 0
-    
-    def update(self, msg):
-        try:
-            if hasattr(msg, "usage_metadata") and msg.usage_metadata:
-                usage = msg.usage_metadata
-                self.input += usage.get("input_tokens", 0)
-                self.output += usage.get("output_tokens", 0)
-                return
+        self.max_input = 0
+        self.total_output = 0
+        self._seen_ids = set()
+        self._streaming_text = "" 
+        self.source_label = "Provider" # По умолчанию считаем, что от провайдера
 
-            if hasattr(msg, "response_metadata") and msg.response_metadata:
-                meta = msg.response_metadata
-                usage = meta.get("token_usage") or meta
-                
-                if isinstance(usage, dict):
-                    p_tokens = usage.get("prompt_tokens", 0)
-                    c_tokens = usage.get("completion_tokens", 0)
-                    if p_tokens or c_tokens:
-                        self.input += p_tokens
-                        self.output += c_tokens
-        except Exception:
-            pass
+    def update_from_message(self, msg: Any):
+        if hasattr(msg, "usage_metadata") and msg.usage_metadata:
+            self._apply_metadata(msg.usage_metadata, getattr(msg, "id", None))
+        
+        if isinstance(msg, (AIMessage, AIMessageChunk)):
+            content = msg.content
+            chunk = ""
+            if isinstance(content, str): chunk = content
+            elif isinstance(content, list):
+                chunk = "".join(x.get("text", "") for x in content if isinstance(x, dict))
+            
+            if isinstance(msg, AIMessageChunk): self._streaming_text += chunk
+            elif not msg.usage_metadata: self._streaming_text = chunk
+
+    def update_from_node_update(self, update: Dict):
+        agent_data = update.get("agent")
+        if not agent_data: return
+        messages = agent_data.get("messages", [])
+        if not isinstance(messages, list): messages = [messages]
+        for msg in messages:
+            if hasattr(msg, "usage_metadata") and msg.usage_metadata:
+                self._apply_metadata(msg.usage_metadata, getattr(msg, "id", None))
+
+    def _apply_metadata(self, usage: Dict, msg_id: str = None):
+        is_new = True
+        if msg_id and msg_id in self._seen_ids: is_new = False
+        
+        # Определяем источник
+        if usage.get("token_source") == "Manual":
+            self.source_label = "Manual"
+        
+        in_t = usage.get("input_tokens", 0)
+        if in_t > self.max_input: self.max_input = in_t
+        
+        out_t = usage.get("output_tokens", 0)
+        if out_t > 0:
+            if is_new:
+                self.total_output += out_t
+                if msg_id: self._seen_ids.add(msg_id)
+                self._streaming_text = ""
 
     def render(self, duration: float) -> str:
-        txt = f"⏱ {duration:.1f}s"
-        if self.input or self.output:
-            txt += f" | In: {self.input} Out: {self.output}"
-        return f"[bright_black]{txt}[/]"
+        display_out = self.total_output
+        if self._streaming_text:
+            est = len(_ENCODER.encode(self._streaming_text)) if _ENCODER else len(self._streaming_text) // 3
+            display_out += est
+            
+        # Добавляем метку источника серым цветом
+        return f"⏱ {duration:.1f}s | In: {self.max_input} Out: {display_out} [dim]({self.source_label})[/]"
+        
+def format_tool_output(name: str, content: str, is_error: bool) -> str:
+    content = str(content).strip()
+    if is_error: 
+        return f"[red]{content[:120]}...[/]" if len(content) > 120 else f"[red]{content}[/]"
+    
+    if "web_search" in name: return f"Found {content.count('http')} results"
+    elif "fetch" in name or "read" in name: return f"Loaded {len(content)} chars"
+    elif "write" in name or "save" in name: return "File saved successfully"
+    elif "list" in name: return f"Listed {len(content.splitlines())} items"
+    
+    return (content[:80] + "...") if len(content) > 80 else content
 
 def get_key_bindings():
     kb = KeyBindings()
@@ -79,136 +165,210 @@ def get_key_bindings():
         event.current_buffer.insert_text("\n")
     return kb
 
-def parse_thought(text: str) -> Tuple[str, str, bool]:
-    match = _THOUGHT_RE.search(text)
-    
-    if match:
-        thought_content = match.group(1).strip()
-        clean_text = _THOUGHT_RE.sub('', text).strip()
-        return thought_content, clean_text, True
-    
-    if "<thought>" in text and "</thought>" not in text:
-        start = text.find("<thought>") + len("<thought>")
-        partial_thought = text[start:].strip()
-        return partial_thought, text[:text.find("<thought>")], False
+# ======================================================
+# 3. STREAM PROCESSOR (STABLE LOGIC)
+# ======================================================
 
-    return "", text, False
-
-async def process_stream(agent_app, user_input: str, thread_id: str):
-    config = {"configurable": {"thread_id": thread_id}}
-    tracker = TokenTracker()
-    start_time = time.time()
+class StreamProcessor:
+    """Стабильный процессор стриминга. Не теряет текст, так как использует накопление."""
     
-    accumulated_text = ""
-    printed_thoughts = set()
-    
-    try:
-        with Live(Spinner("dots", style="cyan"), refresh_per_second=10, console=console, transient=True) as live:
-            
-            async for event in agent_app.astream(
-                {"messages": [HumanMessage(content=user_input)]},
-                config=config,
-                stream_mode="messages"
-            ):
-                msg, metadata = event
-                node = metadata.get("langgraph_node")
-                tracker.update(msg)
+    def __init__(self):
+        self.tracker = TokenTracker()
+        self.full_text = ""          # Весь текст ответа целиком
+        self.printed_len = 0         # Сколько символов мы уже вывели "навечно"
+        self.printed_tool_ids = set()
+        self.status_text = "Thinking..."
+        self.start_time = time.time()
 
-                if node == "agent" and isinstance(msg, (AIMessage, AIMessageChunk)):
-                    if msg.tool_calls:
-                        for tc in msg.tool_calls:
-                            tool_name = tc.get('name')
-                            if tool_name:
-                                live.update(Spinner("earth", text=f"[bold cyan]Вызов:[/] {tool_name}", style="cyan"))                    
-                    
-                    if msg.content:
-                        chunk = msg.content if isinstance(msg.content, str) else ""
-                        if isinstance(msg.content, list):
-                            chunk = "".join(x.get("text", "") for x in msg.content if isinstance(x, dict))
+    async def run(self, agent_app, user_input: str, thread_id: str, max_loops: int):
+        config = {"configurable": {"thread_id": thread_id}, "recursion_limit": max_loops * 4}
+        
+        try:
+            with Live(Spinner("dots", text=self.status_text, style="cyan"), 
+                      refresh_per_second=10, 
+                      console=console, 
+                      transient=True) as live:
+                
+                async for mode, payload in agent_app.astream(
+                    {"messages": [HumanMessage(content=user_input)], "steps": 0},
+                    config=config,
+                    stream_mode=["messages", "updates"]
+                ):
+                    await asyncio.sleep(0.005) # Даем время Rich обновиться
 
-                        if isinstance(msg, AIMessageChunk):
-                            accumulated_text += chunk
-                        else:
-                            if not accumulated_text:
-                                accumulated_text = chunk
-                        
-                        thought, clean_text, is_complete = parse_thought(accumulated_text)
-                        
-                        if thought:
-                            live.update(Spinner("dots", text=f"[yellow italic]{thought}...[/]", style="yellow"))
+                    # 1. ОБНОВЛЕНИЯ ОТ УЗЛОВ (Конец шага)
+                    if mode == "updates":
+                        self.tracker.update_from_node_update(payload)
+                        # Шаг завершен: безопасно печатаем весь накопленный текст
+                        self._commit_printed_text(live)
+
+                    # 2. ПОТОК СООБЩЕНИЙ (Стриминг токенов)
+                    elif mode == "messages":
+                        msg, metadata = payload
+                        node = metadata.get("langgraph_node")
+                        self.tracker.update_from_message(msg)
+
+                        if node == "agent" and isinstance(msg, (AIMessage, AIMessageChunk)):
+                            # Если модель решила вызвать инструмент - сначала печатаем весь текст до этого момента
+                            if msg.tool_calls:
+                                self._commit_printed_text(live)
+                                for tc in msg.tool_calls:
+                                    self._handle_tool_call(tc, live)
                             
-                            if is_complete and thought not in printed_thoughts:
-                                live.console.print(Padding(f"➤ [italic yellow]{thought}[/]", (0, 0, 0, 2)))
-                                printed_thoughts.add(thought)
-                                accumulated_text = clean_text
+                            # Накапливаем текст
+                            if msg.content:
+                                chunk = msg.content if isinstance(msg.content, str) else ""
+                                if isinstance(msg.content, list):
+                                    chunk = "".join(x.get("text", "") for x in msg.content if isinstance(x, dict))
+                                
+                                # Простое накопление. Merge здесь не нужен, так как LangGraph не дублирует стрим.
+                                self.full_text += chunk
 
-                        elif clean_text.strip() and "<thought>" not in accumulated_text:
-                            pretty_md = re.sub(r'\n{3,}', '\n\n', clean_text)
-                            live.update(Padding(Markdown(pretty_md), (1, 1)))
+                        elif node == "tools" and isinstance(msg, ToolMessage):
+                            self._handle_tool_result(msg, live)
+                            
+                    # Обновляем "живой" хвост текста (то, что еще не запечатано)
+                    self._update_live_display(live)
 
-                elif node == "tools" and isinstance(msg, ToolMessage):
-                    res = str(msg.content)
-                    preview = (res[:200] + "...") if len(res) > 200 else res
-                    preview = preview.replace("\n", " ")
-                    
-                    live.console.print(Padding(f"[dim white]✓ {msg.name}: {preview}[/]", (0, 0, 0, 4)))
-                    live.update(Spinner("dots", text="Анализирую...", style="cyan"))
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            console.print("\n[bold red]🛑 Stopped by user[/]")
+            return 
 
-    except KeyboardInterrupt:
-        console.print("\n[bold red]🛑 Генерация прервана пользователем[/]")
-        return 
+        # Финальный вывод остатка
+        self._commit_printed_text(None) # None = печать в основную консоль
+        console.print(self.tracker.render(time.time() - self.start_time), justify="right")
 
-    _, final_clean, _ = parse_thought(accumulated_text)
-    if final_clean.strip():
-        console.print(Padding(Markdown(final_clean), (0, 1, 1, 1)))
-    
-    console.print(tracker.render(time.time() - start_time), justify="right")
+    def _handle_tool_call(self, tc, live):
+        t_id, t_name = tc.get("id"), tc.get("name")
+        args = tc.get("args", {})
+        
+        if t_id and t_name and t_id not in self.printed_tool_ids:
+            # --- ЛОГИКА ИЗВЛЕЧЕНИЯ АРГУМЕНТА ---
+            arg_str = ""
+            if isinstance(args, dict):
+                # Приоритетные ключи, которые мы хотим видеть
+                priority_keys = ["query", "queries", "path", "file_path", "url", "urls", "filename"]
+                for key in priority_keys:
+                    if key in args:
+                        val = args[key]
+                        # Если это список (например, urls или queries), красиво форматируем
+                        if isinstance(val, list):
+                            arg_str = str(val)
+                        else:
+                            arg_str = str(val)
+                        break
+                # Если приоритетных нет, берем первый попавшийся
+                if not arg_str and args:
+                    arg_str = str(list(args.values())[0])
+            elif isinstance(args, str):
+                arg_str = args
+
+            # --- ФОРМАТИРОВАНИЕ ---
+            arg_display = ""
+            if arg_str:
+                clean_arg = str(arg_str).strip().replace("\n", " ")
+                # Обрезаем до 60 символов
+                if len(clean_arg) > 60:
+                    clean_arg = clean_arg[:57] + "..."
+                # [dim] - это серый цвет в Rich
+                arg_display = f" [dim]{clean_arg}[/]"
+
+            # --- ОБНОВЛЕНИЕ СТАТУСА ---
+            # Выводим в спиннер: "Calling: web_search [серый аргумент]"
+            self.status_text = f"[bold cyan]Calling:[/] {t_name}{arg_display}"
+            
+            # Добавляем ID в обработанные, чтобы не мигало
+            self.printed_tool_ids.add(t_id)
+            
+    def _handle_tool_result(self, msg, live):
+        content_str = str(msg.content)
+        is_error = getattr(msg, "status", "") == "error" or content_str.startswith(("Error", "Ошибка"))
+        icon = "❌" if is_error else "✅"
+        color = "red" if is_error else "green"
+        summary = format_tool_output(msg.name, content_str, is_error)
+        
+        live.console.print(Padding(f"[{color}]{icon} {msg.name}:[/] [dim]{summary}[/]", (0, 0, 0, 4)))
+        self.status_text = "Analyzing..."
+
+    def _commit_printed_text(self, live: Optional[Live]):
+        """
+        Берет накопившийся текст, чистит его от тегов <thought>
+        и печатает ту часть, которая еще не была напечатана.
+        """
+        _, clean_full, _ = parse_thought(self.full_text)
+        
+        # Если есть новый текст для печати
+        if len(clean_full) > self.printed_len:
+            new_text = clean_full[self.printed_len:]
+            
+            # Чистим Markdown (убираем лишние отступы)
+            cleaned_chunk = clean_markdown_text(new_text)
+            
+            # Печатаем
+            target = live.console if live else console
+            target.print(Padding(Markdown(cleaned_chunk), (0, 0, 0, 2)))
+            
+            self.printed_len = len(clean_full)
+
+    def _update_live_display(self, live: Live):
+        """Показывает только статус (спиннер) и последние несколько слов."""
+        _, clean_full, _ = parse_thought(self.full_text)
+        
+        # Обновляем текст статуса из <thought> тегов
+        thought_match = _THOUGHT_RE.search(self.full_text)
+        if thought_match:
+            thought_content = thought_match.group(1).strip()
+            self.status_text = f"[yellow italic]{thought_content[-60:]}...[/]"
+        
+        # Хвост, который еще не запечатан.
+        # Это то, что пользователь видит "в процессе набора".
+        pending = clean_full[self.printed_len:]
+        
+        renderable = Spinner("dots", text=self.status_text, style="cyan")
+        
+        if pending.strip():
+             renderable = Group(
+                Padding(Markdown(clean_markdown_text(pending)), (0, 0, 0, 2)),
+                renderable
+             )
+            
+        live.update(renderable)
+
+# ======================================================
+# 4. MAIN LOOP
+# ======================================================
 
 async def main():
     os.system("cls" if os.name == "nt" else "clear")
-    console.print(Panel("[bold blue]AI Agent CLI[/]", subtitle="v2.5"))
+    console.print(Panel("[bold blue]AI Agent CLI[/]", subtitle="v4.7b"))
 
-    # Сохраняем текущий уровень логирования
-    # logger импортируется из agent (строка 29 или 33 вашего кода)
-    previous_level = logger.getEffectiveLevel()
-    
-    # Устанавливаем уровень WARNING, чтобы скрыть обычные сообщения (INFO)
+    # Suppress Logs during init
+    prev_level = logger.getEffectiveLevel()
     logger.setLevel(logging.WARNING)
 
     try:
-        # Теперь спиннер будет крутиться чисто, без прыжков строк
-        with console.status("[bold green]Запуск системы...[/]", spinner="dots"):
+        with console.status("[bold green]Initializing system...[/]", spinner="dots"):
             workflow = AgentWorkflow()
             await workflow.initialize_resources()
             agent_app = workflow.build_graph()
-        
-        console.print("[bold green]Система готова к работе![/]")
+        console.print("[bold green]System Ready![/]")
 
     except Exception as e:
-        console.print(f"[bold red]Ошибка инициализации:[/] {e}")
+        console.print(f"[bold red]Init Error:[/] {e}")
         return
     finally:
-        # Возвращаем уровень логирования обратно (важно для работы агента)
-        logger.setLevel(previous_level)
+        logger.setLevel(prev_level)
         
-    model = (
-        workflow.config.gemini_model
-        if workflow.config.provider == "gemini"
-        else workflow.config.openai_model
-    )
-
-    tools = len(workflow.tools)
-
+    # Info Block
+    cfg = workflow.config
     console.print(
-        f"[dim]Model:[/] [bold cyan]{model}[/]  "
-        f"[dim]Tools:[/] [bold cyan]{tools}[/]"
+        f"[dim]Model:[/] [bold cyan]{cfg.gemini_model if cfg.provider == 'gemini' else cfg.openai_model}[/] "
+        f"[dim]Temp:[/] [bold cyan]{cfg.temperature}[/] "
+        f"[dim]Tools:[/] [bold cyan]{len(workflow.tools)}[/] "
     )
-    
-    console.print(
-        "[bold blue]Enter[/] [bold green]↵[/] — отправить  |  "
-        "[bold blue]Alt+Enter[/] [bold yellow]⎇↵[/] — новая строка\n"
-    )
+    console.print("[bold blue]Enter[/] [bold green]↵[/] — send  |  [bold blue]Alt+Enter[/] [bold yellow]⎇ ↵[/] — new line\n")
 
+    # Prompt Session
     session = PromptSession(
         history=FileHistory(".history"),
         style=Style.from_dict({"prompt": "bold cyan"}),
@@ -222,7 +382,7 @@ async def main():
         try:
             user_input = await session.prompt_async("You > ")
             user_input = user_input.strip()
-
+            
             if not user_input: continue
             if user_input.lower() in ["exit", "quit"]: break
             if user_input.lower() in ["clear", "reset"]:
@@ -230,14 +390,17 @@ async def main():
                 console.print("[yellow]♻ New session started[/]")
                 continue
 
-            await process_stream(agent_app, user_input, thread_id)
+            processor = StreamProcessor()
+            await processor.run(agent_app, user_input, thread_id, cfg.max_loops)
             console.print()
 
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Отменено. Введите 'exit' для выхода.[/]")
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            console.print("\n[yellow]Cancelled. Type 'exit' to quit.[/]")
             continue
         except Exception as e:
             console.print(f"[bold red]Error:[/] {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
 
 if __name__ == "__main__":
     try:

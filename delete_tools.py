@@ -17,11 +17,17 @@ class FileSystemTool(BaseTool):
 
     def _validate_path(self, relative_path: str) -> Tuple[bool, Optional[str], Optional[Path]]:
         try:
-            # Разрешаем путь относительно root_dir
+            # 1. Проверка на абсолютный путь
+            if Path(relative_path).is_absolute():
+                msg = f"ACCESS DENIED: Абсолютные пути не разрешены: '{relative_path}'"
+                logger.warning(f"{self.name}: {msg}")
+                return False, msg, None
+
+            # 2. Разрешаем путь относительно root_dir
             target_path = (self.root_dir / relative_path).resolve()
             root_resolved = self.root_dir.resolve()
 
-            # Python 3.9+ метод для проверки вложенности
+            # 3. Проверка на выход за пределы (Path Traversal)
             if not target_path.is_relative_to(root_resolved):
                 msg = f"ACCESS DENIED: Путь '{relative_path}' выходит за пределы рабочей директории."
                 logger.warning(f"{self.name}: {msg}")
@@ -39,11 +45,11 @@ class FileSystemTool(BaseTool):
 
 
 class DeleteFileInput(BaseModel):
-    file_path: str = Field(description="Относительный путь к файлу")
+    file_path: str = Field(description="Relative path to the file")
 
 class SafeDeleteFileTool(FileSystemTool):
     name: str = "safe_delete_file"
-    description: str = "Безопасно удаляет файл внутри рабочей директории."
+    description: str = "Safely deletes a file within the working directory."
     args_schema: Type[BaseModel] = DeleteFileInput
 
     def _run(self, file_path: str) -> str:
@@ -69,12 +75,12 @@ class SafeDeleteFileTool(FileSystemTool):
 
 
 class DeleteDirectoryInput(BaseModel):
-    dir_path: str = Field(description="Относительный путь к директории")
-    recursive: bool = Field(default=False, description="Удалить рекурсивно")
+    dir_path: str = Field(description="Relative path to the directory")
+    recursive: bool = Field(default=False, description="Delete recursively (for non-empty dirs)")
 
 class SafeDeleteDirectoryTool(FileSystemTool):
     name: str = "safe_delete_directory"
-    description: str = "Безопасно удаляет директорию. Используйте recursive=True для непустых папок."
+    description: str = "Safely deletes a directory. Use recursive=True for non-empty folders."
     args_schema: Type[BaseModel] = DeleteDirectoryInput
 
     def _run(self, dir_path: str, recursive: bool = False) -> str:

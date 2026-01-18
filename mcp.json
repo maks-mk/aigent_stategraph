@@ -1,9 +1,18 @@
 {
   "filesystem": {
     "command": "mcp-server-filesystem",
-    "args": ["{filesystem_path}"],
+    "args": ["."],
     "transport": "stdio",
     "enabled": true
+  },
+  "tavily-remote-mcp": {
+    "command": "npx",
+    "args": ["-y", "--quiet", "mcp-remote", "https://mcp.tavily.com/mcp/?tavilyApiKey=tvly-dev-2y............."],
+    "env": {
+      "npm_config_loglevel": "silent"
+    },
+    "transport": "stdio",
+    "enabled": false
   },
   "duckduckgo": {
     "command": "uvx",
@@ -22,12 +31,5 @@
     "args": ["@simonb97/server-win-cli", "--config", "./win-cli-config.json"],
     "transport": "stdio",
     "enabled": false
-  },
-  "tavily-remote-mcp": {
-    "command": "npx",
-    "args": ["-y", "mcp-remote", "https://mcp.tavily.com/mcp/?tavilyApiKey=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"],
-    "env": {},
-    "transport": "stdio",
-    "enabled": true
   }
 }
